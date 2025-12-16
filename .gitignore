@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+automation.log
+
+# Uploads & Downloads
+uploads/*
+!uploads/.gitkeep
+downloads/*
+!downloads/.gitkeep
+app/downloads/*
+!app/downloads/.gitkeep
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.pyc
+
+# Sensitive files
+gsheet_credentials.json
+*.pem
+*.key
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# Test outputs
+test_*.xlsx
+test_*.csv
+updated_*.xlsx
