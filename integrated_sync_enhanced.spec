@@ -1,78 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""
-PyInstaller spec file for integrated_sync_enhanced.exe
-Includes all dependencies, credential files, and Vestr scraping support
-"""
 
-block_cipher = None
 
 a = Analysis(
     ['integrated_sync_enhanced.py'],
-    pathex=[],
+    pathex=['C:\\Users\\MohammadmahdiRahbari\\Desktop\\amc automate\\ais-amc-automate'],
     binaries=[],
-    datas=[
-        # Credential files
-        ('dropbox_credentials.json', '.'),
-        ('gsheet_credentials.json', '.'),
-    ],
-    hiddenimports=[
-        # Core dependencies
-        'paramiko',
-        'paramiko.rsakey',
-        'paramiko.ed25519key',
-        'paramiko.ecdsakey',
-        'paramiko.dsskey',
-        'requests',
-        'requests.packages.urllib3',
-        'cryptography',
-        'cryptography.hazmat.primitives.asymmetric.rsa',
-        'cryptography.hazmat.primitives.asymmetric.ed25519',
-        'cryptography.hazmat.backends.openssl',
-        # SQLAlchemy dependencies
-        'sqlalchemy',
-        'sqlalchemy.ext.declarative',
-        'sqlalchemy.orm',
-        'sqlalchemy.sql',
-        'sqlalchemy.sql.default_comparator',
-        'sqlalchemy.engine',
-        'sqlalchemy.pool',
-        'sqlalchemy.dialects.postgresql',
-        'sqlalchemy.dialects.postgresql.psycopg2',
-        # PostgreSQL driver
-        'psycopg2',
-        'psycopg2.extensions',
-        'psycopg2.extras',
-        # Vestr scraping
-        'bs4',
-        'beautifulsoup4',
-        'pyotp',
-        'lxml',
-        'lxml.etree',
-        'lxml._elementpath',
-        # Our modules
-        'credinvest_sync',
-        'populate_fee_snapshots',
-        'database_models',
-        'vestr_lightweight',
-        'vestr_fees_lightweight',
-    ],
+    datas=[('gsheet_credentials.json', '.'), ('dropbox_credentials.json', '.'), ('C:\\Users\\MohammadmahdiRahbari\\Desktop\\amc automate\\ais-amc-automate', 'ais-amc-automate')],
+    hiddenimports=['credinvest_sync', 'vestr_fees_lightweight', 'populate_fee_snapshots', 'database_models', 'pywintypes', 'pythoncom', 'win32com', 'win32timezone', 'pyotp', 'bs4', 'requests', 'gspread', 'google.oauth2.service_account', 'pandas._libs.tslibs.timedeltas', 'pandas._libs.tslibs.nattype', 'openpyxl', 'xlsxwriter'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
+    optimize=0,
 )
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='integrated_sync_enhanced',
@@ -82,10 +29,10 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Keep console window for logging output
+    console=True,
     disable_windowed_traceback=False,
+    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None
 )

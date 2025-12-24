@@ -1,172 +1,191 @@
 """
-Populate fee_latest_snapshot table from existing aggregate data.
-This script rebuilds the snapshot table to show latest fees per product.
-Standalone version for AlwaysOnPC project.
+Populate fee_latest_snapshot table using incremental updates.
+Only refresh products whose latest booking date advanced since the last run.
 """
-from datetime import datetime, date
+from datetime import datetime
+from typing import Optional, Tuple
+
+from sqlalchemy import func
+
 from database_models import get_session, VestrFeeRecord, FeeLatestSnapshot
 
 
+def _normalize_product_key(product_isin: Optional[str], product_name: Optional[str]) -> Optional[str]:
+    if product_isin and product_isin.strip():
+        return product_isin.strip()
+    if not product_name:
+        return None
+    sanitized = ''.join(ch if ch.isalnum() else '_' for ch in product_name.upper())
+    key = f"UNKNOWN_{sanitized}"[:32]
+    return key or None
+
+
+def _build_snapshot_payload(
+    session,
+    snapshot_isin: str,
+    raw_isin: Optional[str],
+    product_name: Optional[str]
+) -> Optional[dict]:
+    filters = []
+    if raw_isin:
+        filters.append(VestrFeeRecord.product_isin == raw_isin)
+    elif product_name:
+        filters.append(VestrFeeRecord.product_name == product_name)
+    else:
+        return None
+
+    base_filters = tuple(filters)
+    ordering = (
+        VestrFeeRecord.booking_date.desc(),
+        VestrFeeRecord.booking_datetime.desc(),
+        VestrFeeRecord.updated_at.desc()
+    )
+
+    base_query = session.query(VestrFeeRecord).filter(*base_filters)
+    latest_overall = base_query.order_by(*ordering).first()
+    if not latest_overall:
+        return None
+
+    def latest_of_type(fee_type: str):
+        return session.query(VestrFeeRecord).filter(
+            *base_filters,
+            VestrFeeRecord.fee_type == fee_type
+        ).order_by(*ordering).first()
+
+    latest_mgmt = latest_of_type('ManagementFeeDeduction')
+    latest_perf = latest_of_type('PerformanceFeeDeduction')
+    latest_custody = latest_of_type('CustodyFeeDeduction')
+
+    return {
+        'product_isin': snapshot_isin,
+        'product_name': latest_overall.product_name or product_name,
+        'last_mgmt_fee_date': latest_mgmt.booking_date if latest_mgmt else None,
+        'last_mgmt_fee_amount': abs(latest_mgmt.position_change or 0.0) if latest_mgmt else None,
+        'last_perf_fee_date': latest_perf.booking_date if latest_perf else None,
+        'last_perf_fee_amount': abs(latest_perf.position_change or 0.0) if latest_perf else None,
+        'last_custody_fee_date': latest_custody.booking_date if latest_custody else None,
+        'last_custody_fee_amount': abs(latest_custody.position_change or 0.0) if latest_custody else None,
+        'last_fee_date': latest_overall.booking_date,
+        'last_fee_type': latest_overall.fee_type,
+        'last_fee_amount': abs(latest_overall.position_change or 0.0),
+        'currency': latest_overall.currency,
+        'outstanding_quantity': latest_overall.outstanding_quantity,
+    }
+
+
 def populate_snapshots():
-    """Populate fee_latest_snapshot from vestr_fee_records."""
+    """Incrementally update fee_latest_snapshot with only the newest data."""
     print("=" * 80)
-    print("POPULATE FEE SNAPSHOTS")
+    print("POPULATE FEE SNAPSHOTS (Incremental)")
     print("=" * 80)
-    
+
     session = get_session()
     try:
-        # First, check current state
         raw_count = session.query(VestrFeeRecord).count()
         snapshot_count_before = session.query(FeeLatestSnapshot).count()
-        
+
         print(f"\n📊 Current State:")
         print(f"   Raw records: {raw_count}")
         print(f"   Snapshot records (before): {snapshot_count_before}")
-        
+
         if raw_count == 0:
             print("\n⚠️  No raw records available - cannot populate snapshots")
             return
-        
-        # Get all products from raw records
-        products_data = (
+
+        latest_rows = session.query(
+            VestrFeeRecord.product_name,
+            VestrFeeRecord.product_isin,
+            func.max(VestrFeeRecord.booking_date).label('latest_date')
+        ).group_by(
+            VestrFeeRecord.product_name,
+            VestrFeeRecord.product_isin
+        ).all()
+
+        latest_by_key = {}
+        metadata_by_key = {}
+        for product_name, raw_isin, latest_date in latest_rows:
+            normalized = _normalize_product_key(raw_isin, product_name)
+            if not normalized or not latest_date:
+                continue
+            stored = latest_by_key.get(normalized)
+            if stored is None or latest_date > stored:
+                latest_by_key[normalized] = latest_date
+                metadata_by_key[normalized] = (raw_isin, product_name)
+
+        if not latest_by_key:
+            print("\n⚠️  No products with valid identifiers were found")
+            return
+
+        existing_dates = dict(
             session.query(
-                VestrFeeRecord.product_name,
-                VestrFeeRecord.product_isin
-            )
-            .distinct()
-            .all()
+                FeeLatestSnapshot.product_isin,
+                FeeLatestSnapshot.last_fee_date
+            ).all()
         )
-        
-        print(f"\n🔧 Processing {len(products_data)} products...")
-        
-        # Clear existing snapshots (we'll rebuild from scratch)
-        session.query(FeeLatestSnapshot).delete()
-        session.commit()
-        
-        inserted = 0
-        for product_name, isin in products_data:
-            # Get latest management fee
-            mgmt_latest = (
-                session.query(VestrFeeRecord)
-                .filter(
-                    VestrFeeRecord.product_name == product_name,
-                    VestrFeeRecord.fee_type == 'ManagementFeeDeduction'
-                )
-                .order_by(VestrFeeRecord.booking_date.desc())
-                .first()
-            )
-            
-            # Get latest performance fee
-            perf_latest = (
-                session.query(VestrFeeRecord)
-                .filter(
-                    VestrFeeRecord.product_name == product_name,
-                    VestrFeeRecord.fee_type == 'PerformanceFeeDeduction'
-                )
-                .order_by(VestrFeeRecord.booking_date.desc())
-                .first()
-            )
-            
-            # Get latest custody fee
-            custody_latest = (
-                session.query(VestrFeeRecord)
-                .filter(
-                    VestrFeeRecord.product_name == product_name,
-                    VestrFeeRecord.fee_type == 'CustodyFeeDeduction'
-                )
-                .order_by(VestrFeeRecord.booking_date.desc())
-                .first()
-            )
-            
-            # Determine the most recent fee overall
-            last_fee_date = None
-            last_fee_type = None
-            last_fee_amount = None
-            outstanding_qty = 0
-            
-            if mgmt_latest is not None and perf_latest is not None:
-                # Extract booking_date values into local variables
-                mgmt_bd = getattr(mgmt_latest, 'booking_date', None)
-                perf_bd = getattr(perf_latest, 'booking_date', None)
 
-                if mgmt_bd is not None and perf_bd is not None:
-                    if mgmt_bd >= perf_bd:
-                        last_fee_date = mgmt_bd
-                        last_fee_type = 'ManagementFeeDeduction'
-                        last_fee_amount = mgmt_latest.amount_abs
-                        outstanding_qty = mgmt_latest.outstanding_quantity or 0
-                    else:
-                        last_fee_date = perf_bd
-                        last_fee_type = 'PerformanceFeeDeduction'
-                        last_fee_amount = perf_latest.amount_abs
-                        outstanding_qty = perf_latest.outstanding_quantity or 0
-                else:
-                    # Fallback: prefer whichever booking_date is present
-                    last_fee_date = mgmt_bd or perf_bd
-                    mgmt_cmp = mgmt_bd if mgmt_bd is not None else date.min
-                    perf_cmp = perf_bd if perf_bd is not None else date.min
-                    last_fee_type = 'ManagementFeeDeduction' if mgmt_cmp >= perf_cmp else 'PerformanceFeeDeduction'
-                    last_fee_amount = mgmt_latest.amount_abs or perf_latest.amount_abs
-                    outstanding_qty = mgmt_latest.outstanding_quantity or perf_latest.outstanding_quantity or 0
-            elif mgmt_latest is not None:
-                last_fee_date = mgmt_latest.booking_date
-                last_fee_type = 'ManagementFeeDeduction'
-                last_fee_amount = mgmt_latest.amount_abs
-                outstanding_qty = mgmt_latest.outstanding_quantity or 0
-            elif perf_latest is not None:
-                last_fee_date = perf_latest.booking_date
-                last_fee_type = 'PerformanceFeeDeduction'
-                last_fee_amount = perf_latest.amount_abs
-                outstanding_qty = perf_latest.outstanding_quantity or 0
+        targets = []
+        for key, latest_date in latest_by_key.items():
+            current_date = existing_dates.get(key)
+            if current_date is None or latest_date > current_date:
+                targets.append((key, *metadata_by_key[key]))
 
-            # Check custody fee for overall last fee
-            if custody_latest is not None:
-                custody_bd = getattr(custody_latest, 'booking_date', None)
-                if custody_bd is not None:
-                    if last_fee_date is None or custody_bd > last_fee_date:
-                        last_fee_date = custody_bd
-                        last_fee_type = 'CustodyFeeDeduction'
-                        last_fee_amount = custody_latest.amount_abs
-                        outstanding_qty = custody_latest.outstanding_quantity or 0
+        print(f"\n🔁 Products needing refresh: {len(targets)}")
+        if not targets:
+            print("   Snapshots already reflect the most recent data.")
+            return
 
-            if last_fee_date is not None:  # Only create snapshot if we have at least one fee
-                snapshot = FeeLatestSnapshot(
-                    product_isin=isin or f'UNKNOWN_{product_name[:20]}',
-                    product_name=product_name,
-                    last_mgmt_fee_date=mgmt_latest.booking_date if mgmt_latest else None,
-                    last_mgmt_fee_amount=mgmt_latest.amount_abs if mgmt_latest else None,
-                    last_perf_fee_date=perf_latest.booking_date if perf_latest else None,
-                    last_perf_fee_amount=perf_latest.amount_abs if perf_latest else None,
-                    last_custody_fee_date=custody_latest.booking_date if custody_latest else None,
-                    last_custody_fee_amount=custody_latest.amount_abs if custody_latest else None,
-                    last_fee_date=last_fee_date,
-                    last_fee_type=last_fee_type,
-                    last_fee_amount=last_fee_amount,
-                    outstanding_quantity=outstanding_qty,
-                    currency='EUR'
-                )
+        created = 0
+        updated = 0
+        for snapshot_key, raw_isin, product_name in targets:
+            payload = _build_snapshot_payload(session, snapshot_key, raw_isin, product_name)
+            if not payload:
+                continue
+
+            snapshot = session.query(FeeLatestSnapshot).filter(
+                FeeLatestSnapshot.product_isin == snapshot_key
+            ).one_or_none()
+
+            if snapshot is None:
+                snapshot = FeeLatestSnapshot(product_isin=snapshot_key)
                 session.add(snapshot)
-                inserted += 1
-        
+                created += 1
+            else:
+                updated += 1
+
+            snapshot.product_name = payload['product_name']
+            snapshot.last_mgmt_fee_date = payload['last_mgmt_fee_date']
+            snapshot.last_mgmt_fee_amount = payload['last_mgmt_fee_amount']
+            snapshot.last_perf_fee_date = payload['last_perf_fee_date']
+            snapshot.last_perf_fee_amount = payload['last_perf_fee_amount']
+            snapshot.last_custody_fee_date = payload['last_custody_fee_date']
+            snapshot.last_custody_fee_amount = payload['last_custody_fee_amount']
+            snapshot.last_fee_date = payload['last_fee_date']
+            snapshot.last_fee_type = payload['last_fee_type']
+            snapshot.last_fee_amount = payload['last_fee_amount']
+            snapshot.currency = payload['currency']
+            snapshot.outstanding_quantity = payload['outstanding_quantity']
+            snapshot.synced_at = datetime.utcnow()
+
         session.commit()
-        
-        # Verify results
+
         snapshot_count_after = session.query(FeeLatestSnapshot).count()
-        
-        print(f"\n✅ Snapshots Created:")
-        print(f"   Inserted: {inserted}")
+
+        print(f"\n✅ Snapshot changes applied:")
+        print(f"   Inserted: {created}")
+        print(f"   Updated: {updated}")
         print(f"   Total snapshot records: {snapshot_count_after}")
-        
-        # Show sample data
+
         print(f"\n📋 Sample Snapshots (first 5):")
         samples = session.query(FeeLatestSnapshot).limit(5).all()
         for s in samples:
-            print(f"   {s.product_name[:30]:30} | Units: {s.outstanding_quantity:>10.2f} | Last: {s.last_fee_date}")
-        
+            print(
+                f"   {s.product_name[:30]:30} | Units: {s.outstanding_quantity or 0:>10.2f} | Last: {s.last_fee_date}"
+            )
+
         print("\n" + "=" * 80)
         print("COMPLETE")
         print("=" * 80)
-        
+
     except Exception as e:
         session.rollback()
         print(f"\n❌ Error: {e}")

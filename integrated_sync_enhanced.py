@@ -18,7 +18,9 @@ Options:
   --skip-credinvest          Skip Credinvest SFTP sync
   --skip-vestr-fees          Skip Vestr fee sync
   --skip-fee-snapshots       Skip fee snapshot population
+    --skip-fee-aggregation     Skip refreshing aggregated fee tables
   --delete-after-upload      Delete local files after successful Dropbox upload
+    --ais-root PATH            Explicit path to ais-amc-automate repo for aggregation helpers
   --log-file PATH            Custom log file path (default: logs/integrated_sync.log)
 """
 import sys
@@ -27,6 +29,7 @@ import logging
 import argparse
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+import subprocess
 
 # Import modules
 try:
@@ -49,6 +52,75 @@ try:
 except ImportError:
     ensure_fee_tables = None
     get_session = None
+
+
+def discover_and_add_project_root(explicit_root=None):
+    """Try to discover the ais-amc-automate project root and add it to sys.path.
+
+    If `explicit_root` is provided, use and validate it.
+    Returns the path added or None.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # If user provided explicit root, prefer that
+    if explicit_root:
+        explicit_root = os.path.abspath(explicit_root)
+        marker = os.path.join(explicit_root, 'app', 'processors', 'fee_aggregator.py')
+        if os.path.exists(marker):
+            if explicit_root not in sys.path:
+                sys.path.insert(0, explicit_root)
+            return explicit_root
+
+    # Search Desktop siblings for ais-amc-automate folder specifically
+    parent = os.path.abspath(os.path.join(here, '..'))
+    try:
+        for name in os.listdir(parent):
+            potential = os.path.join(parent, name)
+            # Prioritize folders containing 'ais-amc-automate'
+            if 'ais-amc-automate' in potential.lower():
+                marker = os.path.join(potential, 'app', 'processors', 'fee_aggregator.py')
+                if os.path.exists(marker):
+                    if potential not in sys.path:
+                        sys.path.insert(0, potential)
+                    return potential
+    except Exception:
+        pass
+
+    # Fallback: any folder with fee_aggregator marker
+    try:
+        for name in os.listdir(parent):
+            potential = os.path.join(parent, name)
+            marker = os.path.join(potential, 'app', 'processors', 'fee_aggregator.py')
+            if os.path.exists(marker) and 'aisrender' not in potential.lower():
+                if potential not in sys.path:
+                    sys.path.insert(0, potential)
+                return potential
+    except Exception:
+        pass
+
+    return None
+
+
+def run_fee_aggregation_task(project_root=None):
+    """Run the FeeAggregator from ais-amc-automate to refresh summary tables."""
+
+    root = discover_and_add_project_root(project_root)
+    if not root:
+        raise RuntimeError("Unable to locate ais-amc-automate project root for fee aggregation")
+
+    try:
+        from app.processors.fee_aggregator import FeeAggregator  # type: ignore
+        from app.models.database import get_session  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(f"Failed to import FeeAggregator from {root}: {exc}") from exc
+
+    session = get_session()
+    try:
+        aggregator = FeeAggregator()
+        stats = aggregator.aggregate_new_data(session)
+        return stats
+    finally:
+        session.close()
 
 
 def setup_logging(log_file=None, console_level=logging.INFO):
@@ -110,15 +182,22 @@ def run_integrated_sync(args):
     print("=" * 80)
     logger.info("Starting integrated sync session")
     logger.info(f"Arguments: {vars(args)}")
+
+    project_root = discover_and_add_project_root(getattr(args, 'ais_root', None))
+    if project_root:
+        logger.info("Detected ais-amc-automate root at %s", project_root)
+    else:
+        logger.warning("Could not automatically locate ais-amc-automate; aggregation helpers may not run")
     
     success_count = 0
     total_tasks = 0
     errors = []
+    aggregation_stats = None
     
     # Task 1: Credinvest SFTP sync
     if not args.skip_credinvest:
         total_tasks += 1
-        print("\n[1/3] Running Credinvest SFTP sync...")
+        print("\n[1/4] Running Credinvest SFTP sync...")
         print("-" * 80)
         logger.info("=== TASK 1: Credinvest SFTP Sync ===")
         try:
@@ -149,13 +228,13 @@ def run_integrated_sync(args):
             print(f"[ERROR] Credinvest sync failed: {e}")
             errors.append(f"Credinvest sync: {str(e)}")
     else:
-        print("\n[1/3] Skipping Credinvest sync (--skip-credinvest)")
+        print("\n[1/4] Skipping Credinvest sync (--skip-credinvest)")
         logger.info("Skipping Credinvest SFTP sync (user requested)")
     
     # Task 2: Vestr fee data sync
     if not args.skip_vestr_fees:
         total_tasks += 1
-        print("\n[2/3] Running Vestr fee data sync...")
+        print("\n[2/4] Running Vestr fee data sync...")
         print("-" * 80)
         logger.info("=== TASK 2: Vestr Fee Data Sync ===")
         try:
@@ -167,10 +246,45 @@ def run_integrated_sync(args):
             # Ensure database tables exist
             logger.info("Ensuring fee tables exist in database...")
             ensure_fee_tables()
-            
-            # Run incremental sync (fetch latest data)
-            logger.info("Starting incremental fee sync from Vestr...")
-            result = sync_fees_dataset(force_full=False)
+
+            # If user requested a full bootstrap, call the scraper directly.
+            if getattr(args, 'full', False):
+                logger.info("Starting FULL fee sync from Vestr (force_full=True)")
+                result = sync_fees_dataset(force_full=True)
+            else:
+                # Prefer a targeted sync that fetches only records after the
+                # latest booking date present in the DB. The helper
+                # `run_sync_after_db_latest.py` performs that logic and is
+                # located in the ais-amc-automate `scripts` folder. If the
+                # helper is unavailable, fall back to the incremental
+                # `sync_fees_dataset` behavior.
+                helper_path = None
+                if project_root:
+                    helper_path = os.path.join(project_root, 'scripts', 'run_sync_after_db_latest.py')
+
+                # If not found, try common nearby locations (Desktop sibling layout)
+                if not helper_path or not os.path.exists(helper_path):
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    parent = os.path.abspath(os.path.join(here, '..'))
+                    candidates = [
+                        os.path.join(parent, '..', 'amc automate', 'ais-amc-automate', 'scripts', 'run_sync_after_db_latest.py'),
+                        os.path.join(parent, '..', 'ais-amc-automate', 'scripts', 'run_sync_after_db_latest.py'),
+                        os.path.join(parent, 'amc automate', 'ais-amc-automate', 'scripts', 'run_sync_after_db_latest.py'),
+                    ]
+                    for cand in candidates:
+                        cand = os.path.abspath(cand)
+                        if os.path.exists(cand):
+                            helper_path = cand
+                            break
+
+                if helper_path and os.path.exists(helper_path):
+                    cmd = [sys.executable, helper_path]
+                    logger.info("Running targeted backfill helper: %s", ' '.join(cmd))
+                    proc = subprocess.run(cmd)
+                    result = {"subprocess_returncode": proc.returncode}
+                else:
+                    logger.info("Starting incremental fee sync from Vestr (fallback)")
+                    result = sync_fees_dataset(force_full=False)
             
             if result:
                 logger.info("[SUCCESS] Vestr fee sync completed successfully")
@@ -185,32 +299,62 @@ def run_integrated_sync(args):
             print(f"[ERROR] Vestr fee sync failed: {e}")
             errors.append(f"Vestr fee sync: {str(e)}")
     else:
-        print("\n[2/3] Skipping Vestr fee sync (--skip-vestr-fees)")
+        print("\n[2/4] Skipping Vestr fee sync (--skip-vestr-fees)")
         logger.info("Skipping Vestr fee data sync (user requested)")
     
-    # Task 3: Fee snapshot population
-    if not args.skip_fee_snapshots:
+    # Task 3: Fee aggregation
+    if not getattr(args, 'skip_fee_aggregation', False):
         total_tasks += 1
-        print("\n[3/3] Running fee snapshot population...")
+        print("\n[3/4] Running fee aggregation...")
         print("-" * 80)
-        logger.info("=== TASK 3: Fee Snapshot Population ===")
+        logger.info("=== TASK 3: Fee Aggregation ===")
         try:
-            if populate_snapshots is None:
-                raise ImportError("populate_fee_snapshots module not available")
-            
-            # Run snapshot population
-            logger.info("Populating fee snapshots from aggregated data...")
-            populate_snapshots()
-            
-            logger.info("[SUCCESS] Fee snapshot population completed successfully")
-            print("[SUCCESS] Fee snapshot population completed")
+            stats = run_fee_aggregation_task(project_root)
+            aggregation_stats = stats
+            logger.info("Fee aggregation stats: %s", stats)
+            print("[SUCCESS] Fee aggregation completed")
             success_count += 1
         except Exception as e:
-            logger.error(f"[ERROR] Fee snapshot population failed: {e}", exc_info=True)
-            print(f"[ERROR] Fee snapshot population failed: {e}")
-            errors.append(f"Fee snapshot population: {str(e)}")
+            logger.error(f"[ERROR] Fee aggregation failed: {e}", exc_info=True)
+            print(f"[ERROR] Fee aggregation failed: {e}")
+            errors.append(f"Fee aggregation: {str(e)}")
     else:
-        print("\n[3/3] Skipping fee snapshot population (--skip-fee-snapshots)")
+        print("\n[3/4] Skipping fee aggregation (--skip-fee-aggregation)")
+        logger.info("Skipping fee aggregation (user requested)")
+
+    # Task 4: Fee snapshot population
+    if not args.skip_fee_snapshots:
+        skip_snapshot_due_to_fresh_data = (
+            aggregation_stats is not None and
+            aggregation_stats.get('raw_records_processed', 0) == 0 and
+            aggregation_stats.get('snapshots_updated', 0) == 0
+        )
+        if skip_snapshot_due_to_fresh_data:
+            total_tasks += 1
+            print("\n[4/4] Skipping fee snapshot population (already current)")
+            logger.info("Skipping fee snapshot population: aggregator reported no new data")
+            success_count += 1
+        else:
+            total_tasks += 1
+            print("\n[4/4] Running fee snapshot population...")
+            print("-" * 80)
+            logger.info("=== TASK 4: Fee Snapshot Population ===")
+            try:
+                if populate_snapshots is None:
+                    raise ImportError("populate_fee_snapshots module not available")
+                
+                logger.info("Populating fee snapshots from aggregated data...")
+                populate_snapshots()
+                
+                logger.info("[SUCCESS] Fee snapshot population completed successfully")
+                print("[SUCCESS] Fee snapshot population completed")
+                success_count += 1
+            except Exception as e:
+                logger.error(f"[ERROR] Fee snapshot population failed: {e}", exc_info=True)
+                print(f"[ERROR] Fee snapshot population failed: {e}")
+                errors.append(f"Fee snapshot population: {str(e)}")
+    else:
+        print("\n[4/4] Skipping fee snapshot population (--skip-fee-snapshots)")
         logger.info("Skipping fee snapshot population (user requested)")
     
     # Final summary
@@ -264,6 +408,11 @@ def main():
         help='Skip fee snapshot population'
     )
     parser.add_argument(
+        '--skip-fee-aggregation',
+        action='store_true',
+        help='Skip refreshing aggregated fee tables'
+    )
+    parser.add_argument(
         '--delete-after-upload',
         action='store_true',
         help='Delete local files after successful Dropbox upload'
@@ -272,6 +421,11 @@ def main():
         '--log-file',
         default=None,
         help='Custom log file path (default: logs/integrated_sync_YYYYMMDD.log)'
+    )
+    parser.add_argument(
+        '--ais-root',
+        default=None,
+        help='Explicit path to the ais-amc-automate repo when running cross-project helpers'
     )
     parser.add_argument(
         '--verbose', '-v',
