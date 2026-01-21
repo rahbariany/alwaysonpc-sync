@@ -114,18 +114,35 @@ def discover_and_add_project_root(explicit_root=None):
     return None
 
 
-def _has_vestr_credentials() -> bool:
-    """Check if Vestr credentials are available (env vars or hardcoded in vestr_lightweight)."""
+def _has_vestr_credentials(logger: logging.Logger | None = None) -> bool:
+    """Return True if the Vestr fee sync has credentials available.
+
+    Primary source is env vars (recommended). As a fallback for legacy/local
+    setups, some scrapers may embed defaults; in that case we allow the sync
+    to proceed so it can self-validate.
+    """
+
     user = os.environ.get('VESTR_USERNAME')
     pw = os.environ.get('VESTR_PASSWORD')
-    
-    # If env vars are set, validate them
-    if user or pw:
-        return bool(user and user.strip() and pw and pw.strip())
-    
-    # Otherwise, vestr_lightweight has hardcoded credentials
-    # (username="crudi", password="Minimarseillais1#", otp_secret="KRRHIUCNGRBHOZLRHBBVAUSDGZJUC4SM")
-    return True
+    if user and user.strip() and pw and pw.strip():
+        return True
+
+    # Fallback: if the underlying scraper has usable configured credentials.
+    try:
+        from vestr_lightweight import LightweightVestrScraper  # type: ignore
+
+        scraper = LightweightVestrScraper()
+        if getattr(scraper, 'username', None) and getattr(scraper, 'password', None):
+            if logger:
+                logger.warning(
+                    "VESTR_USERNAME/VESTR_PASSWORD not set; proceeding with scraper-configured credentials. "
+                    "Set env vars for production."
+                )
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def run_fee_aggregation_task(project_root=None):
@@ -270,10 +287,10 @@ def run_integrated_sync(args):
             if ensure_fee_tables is None:
                 raise ImportError("database_models module not available")
 
-            if not _has_vestr_credentials():
+            if not _has_vestr_credentials(logger):
                 raise RuntimeError(
                     "Missing Vestr credentials. Set VESTR_USERNAME and VESTR_PASSWORD environment variables "
-                    "or use the hardcoded credentials in vestr_lightweight.py"
+                    "(or configure credentials in the scraper)."
                 )
             
             # Ensure database tables exist
@@ -313,22 +330,28 @@ def run_integrated_sync(args):
                 if helper_path and os.path.exists(helper_path):
                     cmd = [sys.executable, helper_path]
                     logger.info("Running targeted backfill helper: %s", ' '.join(cmd))
-                    
-                    # Pass Vestr credentials to subprocess (ais-amc-automate version needs env vars)
-                    run_env = os.environ.copy()
-                    if not run_env.get('VESTR_USERNAME'):
-                        # Use hardcoded credentials from AlwaysOnPC's vestr_lightweight
+                    run_env = None
+                    # If Vestr credentials are not present in the environment, but the
+                    # local lightweight scraper has credentials configured (legacy/local
+                    # defaults), forward them to the helper subprocess so it can log in.
+                    if not (os.environ.get('VESTR_USERNAME') and os.environ.get('VESTR_PASSWORD')):
                         try:
-                            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-                            from vestr_lightweight import LightweightVestrScraper
+                            from vestr_lightweight import LightweightVestrScraper  # type: ignore
+
                             scraper = LightweightVestrScraper()
-                            run_env['VESTR_USERNAME'] = scraper.username
-                            run_env['VESTR_PASSWORD'] = scraper.password
-                            run_env['VESTR_OTP_SECRET'] = scraper.otp_secret
-                            logger.info("Using hardcoded Vestr credentials from AlwaysOnPC")
-                        except Exception as cred_exc:
-                            logger.warning("Could not extract hardcoded credentials: %s", cred_exc)
-                    
+                            if getattr(scraper, 'username', None) and getattr(scraper, 'password', None):
+                                run_env = os.environ.copy()
+                                run_env['VESTR_USERNAME'] = str(scraper.username)
+                                run_env['VESTR_PASSWORD'] = str(scraper.password)
+                                if getattr(scraper, 'otp_secret', None):
+                                    run_env['VESTR_OTP_SECRET'] = str(scraper.otp_secret)
+                                if getattr(scraper, 'totp_time_offset_seconds', None) is not None:
+                                    run_env['VESTR_TOTP_TIME_OFFSET_SECONDS'] = str(
+                                        int(getattr(scraper, 'totp_time_offset_seconds') or 0)
+                                    )
+                        except Exception:
+                            run_env = None
+
                     proc = subprocess.run(cmd, env=run_env)
                     result = {"subprocess_returncode": proc.returncode}
                 else:
@@ -337,7 +360,7 @@ def run_integrated_sync(args):
 
             ok = False
             if isinstance(result, dict) and "subprocess_returncode" in result:
-                ok = int(result.get("subprocess_returncode", 1)) == 0
+                ok = int(result.get("subprocess_returncode") or 1) == 0
             else:
                 ok = bool(result)
 
@@ -346,7 +369,7 @@ def run_integrated_sync(args):
                 print("[SUCCESS] Vestr fee sync completed")
                 success_count += 1
             else:
-                logger.error("[ERROR] Vestr fee sync failed: %s", result)
+                logger.warning("[WARNING] Vestr fee sync did not complete cleanly: %s", result)
                 print("[ERROR] Vestr fee sync failed")
                 errors.append(f"Vestr fee sync: failed ({result})")
         except Exception as e:

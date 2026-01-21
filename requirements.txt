@@ -10,5 +10,12 @@ beautifulsoup4>=4.11.0
 pyotp>=2.8.0
 lxml>=4.9.0
 
+# Dropbox integration
+dropbox>=11.36.0
+
+# Google Sheets (for credentials validation)
+gspread>=5.7.0
+google-auth>=2.16.0
+
 # For building executable
-pyinstaller>=5.0.0
+pyinstaller>=5.13.0
